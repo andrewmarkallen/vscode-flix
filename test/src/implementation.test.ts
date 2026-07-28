@@ -16,13 +16,17 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { getTestDocUri, init } from './util'
+import { getFixtureDocUri, init, teardown } from './util'
 
 suite('ImplementationProvider', () => {
-  const dividableDocUri = getTestDocUri('src/Dividable.flix')
+  const dividableDocUri = getFixtureDocUri('implementation', 'Dividable.flix')
 
   suiteSetup(async () => {
     await init('implementation')
+  })
+
+  suiteTeardown(async () => {
+    await teardown('implementation')
   })
 
   test('Should not show anything on empty line', async () => {

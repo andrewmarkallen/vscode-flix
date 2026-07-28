@@ -16,19 +16,21 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { getTestDocUri, init, open, stringify } from './util'
+import { getFixtureDocUri, init, stringify, teardown } from './util'
 
 suite('CodeActionProvider', () => {
-  const mainDocUri = getTestDocUri('src/Main.flix')
-  const dateDocUri = getTestDocUri('src/Date.flix')
+  const mainDocUri = getFixtureDocUri('codeActions', 'Main.flix')
+  const dateDocUri = getFixtureDocUri('codeActions', 'Date.flix')
 
   suiteSetup(async () => {
     await init('codeActions')
   })
 
-  test('Empty line should not suggest code actions', async () => {
-    await open(mainDocUri)
+  suiteTeardown(async () => {
+    await teardown('codeActions')
+  })
 
+  test('Empty line should not suggest code actions', async () => {
     const r = await vscode.commands.executeCommand<vscode.CodeAction[]>(
       'vscode.executeCodeActionProvider',
       mainDocUri,
@@ -47,8 +49,6 @@ suite('CodeActionProvider', () => {
   })
 
   async function testCodeAction(docUri: vscode.Uri, position: vscode.Position, expectedKeywords: string[]) {
-    await open(docUri)
-
     const r = await vscode.commands.executeCommand<vscode.CodeAction[]>(
       'vscode.executeCodeActionProvider',
       docUri,

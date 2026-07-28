@@ -16,80 +16,65 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { getTestDocUri, init, copyFile, deleteFile, replaceDocumentContent } from './util'
+import { blankFile, getFixtureDocUri, init, loadFile, teardown } from './util'
 
 suite('Diagnostics', () => {
-  /** The optional URI of the document which should be deleted after each test. */
-  let tempDocUri: vscode.Uri | null = null
-
   suiteSetup(async () => {
     await init('diagnostics')
   })
 
-  teardown(async () => {
-    if (tempDocUri !== null) {
-      await deleteFile(tempDocUri)
-    }
+  suiteTeardown(async () => {
+    await teardown('diagnostics')
   })
 
-  test('Should show WeederError', async () => {
-    await testDiagnostics('WeederError.flix', ['duplicate', 'parameter'])
+  test('Should show NameError', () => {
+    testDiagnostics('NameError.flix', ['duplicate', 'definition'])
   })
 
-  test('Should show NameError', async () => {
-    await testDiagnostics('NameError.flix', ['duplicate', 'definition'])
+  test('Should show ResolutionError', () => {
+    testDiagnostics('ResolutionError.flix', ['undefined', 'name'])
   })
 
-  test('Should show ResolutionError', async () => {
-    await testDiagnostics('ResolutionError.flix', ['cyclic', 'type'])
+  test('Should show TypeError', () => {
+    testDiagnostics('TypeError.flix', ['expected', 'type', 'found'])
   })
 
-  test('Should show TypeError', async () => {
-    await testDiagnostics('TypeError.flix', ['expected', 'type', 'found'])
+  test('Should show RedundancyError', () => {
+    testDiagnostics('RedundancyError.flix', ['shadowed'])
   })
 
-  test('Should show RedundancyError', async () => {
-    await testDiagnostics('RedundancyError.flix', ['shadowed'])
-  })
-
-  test('Should show SafetyError', async () => {
-    await testDiagnostics('SafetyError.flix', ['throw'])
+  test('Should show SafetyError', () => {
+    testDiagnostics('SafetyError.flix', ['throw'])
   })
 
   test('Should clear diagnostics when file content is cleared', async () => {
-    const srcUri = getTestDocUri('src/ClearTest.flix')
-    const latentUri = getTestDocUri('latent/WeederError.flix')
-
-    // Delete the file after the test
-    tempDocUri = srcUri
-
-    // Copy a file with errors into src/
-    await copyFile(latentUri, srcUri)
+    const docUri = getFixtureDocUri('diagnostics', 'NameError.flix')
 
     // Verify the error is present
-    const before = vscode.languages.getDiagnostics(srcUri)
+    const before = vscode.languages.getDiagnostics(docUri)
     assert.strictEqual(before.length > 0, true, 'Expected diagnostics before clearing')
 
     // Clear the file content (simulates select all + delete)
-    await replaceDocumentContent(srcUri, '')
+    await blankFile(docUri)
 
     // Verify the error is gone
-    const after = vscode.languages.getDiagnostics(srcUri)
+    const after = vscode.languages.getDiagnostics(docUri)
+
+    // Restore the file, so that this test does not depend on being the last one
+    await loadFile(docUri)
+
     assert.strictEqual(after.length, 0, `Expected no diagnostics after clearing, got: ${JSON.stringify(after)}`)
   })
 
   /**
-   * Assert that copying the file `fileName` from the `latent` directory to the `src` directory results in a diagnostic message containing all of the `expectedKeywords` (case-insensitive).
+   * Assert that the file `fileName` of the test workspace has a diagnostic message containing all of the `expectedKeywords` (case-insensitive).
    */
-  async function testDiagnostics(fileName: string, expectedKeywords: string[]) {
-    const latentUri = getTestDocUri(`latent/${fileName}`)
-    const srcUri = getTestDocUri(`src/${fileName}`)
+  function testDiagnostics(fileName: string, expectedKeywords: string[]) {
+    assertDiagnostics(getFixtureDocUri('diagnostics', fileName), expectedKeywords)
+  }
 
-    // Delete the file after the test
-    tempDocUri = srcUri
-    await copyFile(latentUri, srcUri)
-
-    const diagnostics = vscode.languages.getDiagnostics(srcUri)
+  function assertDiagnostics(docUri: vscode.Uri, expectedKeywords: string[]) {
+    const diagnostics = vscode.languages.getDiagnostics(docUri)
     assert.strictEqual(
       diagnostics.some(d => {
         const msgLower = d.message.toLowerCase()

@@ -16,13 +16,17 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { findMarkerPosition, getTestDocUri, init } from './util'
+import { findMarkerPosition, getFixtureDocUri, init, teardown } from './util'
 
 suite('GotoDefinitionProvider', () => {
-  const mainDocUri = getTestDocUri('src/Main.flix')
+  const mainDocUri = getFixtureDocUri('goto', 'Main.flix')
 
   suiteSetup(async () => {
     await init('goto')
+  })
+
+  suiteTeardown(async () => {
+    await teardown('goto')
   })
 
   test('Should go to definition of formal parameter', async () => {

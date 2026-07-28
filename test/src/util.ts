@@ -26,18 +26,21 @@ import * as vscode from 'vscode'
 const CHECK_TIMEOUT_MS = 20000
 
 /**
- * How long to wait for the compiler to stay quiescent before considering a batch of workspace file
- * changes fully settled. Must exceed the reconciliation debounce in the client's file watchers
- * (`scheduleReconciliation`, currently 300ms), which can enqueue a follow-up check *after* the
- * change's initial check has already gone idle. See {@linkcode settleAfterChange}.
- */
-const RECONCILE_SETTLE_MS = 500
-
-/**
- * Activates the extension and swaps the active workspace to the contents of the given test workspace
- * directory, waiting deterministically for the compiler to finish compiling the result.
+ * Activates the extension and loads the contents of the given test workspace directory into the
+ * compiler directly, without touching the file system.
  *
- * @param testWorkspaceName The name of the workspace directory to copy, e.g. `codeActions`.
+ * Every `.flix` file directly in the directory is handed to the compiler by URI and content via the
+ * `flix.addUri` test command, so the files are compiled where they live in `testWorkspaces` — use
+ * {@linkcode getFixtureDocUri} to refer to them. Nothing is copied into the active workspace, and
+ * since nothing changes on disk, no file-system watcher is involved.
+ *
+ * The directory therefore holds plain files rather than a workspace layout: no `flix.toml`, and no
+ * `src` directory. Files in a subdirectory are not loaded — see {@linkcode loadFile}.
+ *
+ * The suite must call {@linkcode teardown} with the same name when it is done, since no file-system
+ * watcher will ever report these files as gone.
+ *
+ * @param testWorkspaceName The name of the workspace directory to load, e.g. `codeActions`.
  */
 export async function init(testWorkspaceName: string) {
   // Show errors in the console
@@ -52,119 +55,168 @@ export async function init(testWorkspaceName: string) {
     throw new Error('Failed to activate extension')
   }
 
-  vscode.commands.executeCommand('workbench.action.closeAllEditors')
-  const activeWorkspaceUri = vscode.workspace.workspaceFolders![0].uri
+  await vscode.commands.executeCommand('workbench.action.closeAllEditors')
 
-  // The `flix.checkCount` synchronization used below only works once the extension is running.
-  //
-  // On the very first suite the extension has not started yet: there is no check baseline to capture
-  // and no file-system watcher to report the changes below, so the copied files are instead picked
-  // up by the initial workspace scan performed when `ext.activate()` runs. On every later suite the
-  // extension is already active and we synchronize on the checks its watchers trigger.
-  const wasActive = ext.isActive
+  const fixtureUris = await findFixtureFiles(testWorkspaceName)
 
-  // Remove the previous suite's files. When the extension is already running, wait for the compiler
-  // to observe the removals *before* copying the new files. Otherwise VS Code can coalesce a
-  // delete-then-create of the same path into a single change event, which the file-system watcher
-  // does not handle — leaving the compiler with stale file contents.
-  const clearBaseline = wasActive ? await getCheckCount() : 0
-  const removedFlixFiles = await clearDir(activeWorkspaceUri)
-  if (wasActive && removedFlixFiles > 0) {
-    await settleAfterChange(clearBaseline)
+  if (!ext.isActive) {
+    // Every suite which puts files in the active workspace deletes them again, so it is only left
+    // dirty by an interrupted run. Clean it before the extension starts, so that the compiler never
+    // hears about those files: making it forget them afterwards would race with the workspace scan,
+    // which is only enqueued once the compiler connects — that is, after `activate()` has returned.
+    await deleteWorkspaceFiles()
   }
 
-  // Copy in the new workspace.
-  const copyBaseline = wasActive ? await getCheckCount() : 0
-  const testWorkspacePath = path.resolve(__dirname, '../testWorkspaces', testWorkspaceName)
-  await copyDirContents(vscode.Uri.file(testWorkspacePath), activeWorkspaceUri)
-
   // Ensure the extension is active. On the first suite this starts (and, on a cold CI run,
-  // downloads) the compiler and triggers the initial scan+compile of the files copied above.
+  // downloads) the compiler. `ext.activate()` only resolves once the server has been told to start,
+  // so the notifications sent below are ordered after it.
   await ext.activate()
 
-  // Wait for the compiler to finish compiling the new workspace and go idle.
-  await settleAfterChange(copyBaseline)
+  for (const uri of fixtureUris) {
+    await addFileToCompiler(uri, await readFileContent(uri))
+  }
+
+  // Open the documents here, so the `didOpen` each of them triggers is handled as part of the setup
+  // rather than in the middle of a test.
+  await Promise.all(fixtureUris.map(uri => vscode.workspace.openTextDocument(uri)))
+
+  await awaitIdle()
 }
 
 /**
- * Recursively deletes all test-owned files (matched by extension) from `uri`, always keeping
- * `.gitkeep` and `flix.jar`.
+ * Blanks every file loaded by {@linkcode init} from the given test workspace directory, so that
+ * they no longer contribute anything to the program, and waits for the compiler to finish
+ * recompiling.
  *
- * @returns the number of `.flix` files that were removed, so the caller can tell whether the
- * deletion will trigger a recompile to wait for.
+ * Since the files are compiled where they live in `testWorkspaces`, no file-system watcher will ever
+ * report them as gone, so a suite has to clean up after itself — otherwise its definitions would
+ * still be part of the program compiled by the next suite. Only the content held by the compiler is
+ * emptied; the files on disk are left untouched.
+ *
+ * @param testWorkspaceName The name of the workspace directory which was loaded, e.g. `codeActions`.
  */
-async function clearDir(uri: vscode.Uri): Promise<number> {
-  const contents = await vscode.workspace.fs.readDirectory(uri)
+export async function teardown(testWorkspaceName: string) {
+  for (const uri of await findFixtureFiles(testWorkspaceName)) {
+    await addFileToCompiler(uri, '')
+  }
+  await awaitIdle()
+}
 
-  // Recurse into subdirectories
-  const dirs = contents.filter(([_, type]) => type === vscode.FileType.Directory)
-  const dirUris = dirs.map(([name, _]) => vscode.Uri.joinPath(uri, name))
-  const removedInSubdirs = await Promise.all(dirUris.map(clearDir))
+/**
+ * Loads the file at `uri` into the compiler with its content as it is on disk, without copying it
+ * anywhere, and waits for the compiler to process it.
+ *
+ * As with {@linkcode init}, no file-system watcher will ever report this file as gone, so the
+ * caller has to {@linkcode blankFile} it again once it should no longer be part of the program.
+ */
+export async function loadFile(uri: vscode.Uri) {
+  await addFileToCompiler(uri, await readFileContent(uri))
+  await awaitIdle()
+}
 
-  const files = contents.filter(([_, type]) => type !== vscode.FileType.Directory)
-  const fileNames = files.map(([name, _]) => name)
+/**
+ * Empties the content the compiler holds for the file at `uri`, so that it no longer contributes
+ * anything to the program, and waits for the compiler to process it.
+ *
+ * The file itself is left untouched on disk.
+ */
+export async function blankFile(uri: vscode.Uri) {
+  await addFileToCompiler(uri, '')
+  await awaitIdle()
+}
 
-  // Be careful, and only delete files with known extensions
-  const extensionsToDelete = ['flix', 'toml', 'jar', 'fpkg', 'txt']
+/**
+ * Hands the file at `uri` to the compiler with `src` as its content, without waiting for the
+ * compiler to process it.
+ *
+ * The notification this sends and the one {@linkcode awaitIdle} sends travel the same ordered
+ * connection, and the server enqueues the resulting job as it handles the notification. Waiting for
+ * the compiler to go idle afterwards therefore covers this file — no check has to be counted, as it
+ * does for a change the extension only hears about through a file-system watcher.
+ */
+async function addFileToCompiler(uri: vscode.Uri, src: string) {
+  await vscode.commands.executeCommand('flix.addUri', uri.toString(), src)
+}
 
-  // Always keep .gitkeep and flix.jar
-  const namesToKeep = ['.gitkeep', 'flix.jar']
-
-  const namesToDelete = fileNames.filter(
-    name => !namesToKeep.includes(name) && extensionsToDelete.includes(name.split('.').at(-1)),
+/**
+ * Deletes the files of the active workspace which the extension would hand to the compiler when it
+ * scans the workspace.
+ *
+ * Must only be called while the extension is not running: there is no file-system watcher to report
+ * the deletions then, which is the point — the compiler is never told about these files at all.
+ */
+async function deleteWorkspaceFiles() {
+  const activeWorkspaceFolder = vscode.workspace.workspaceFolders![0]
+  // NB: Must match `getFlixGlobPattern` and `getFpkgGlobPattern` in `client/src/util/workspace.ts`.
+  const pattern = new vscode.RelativePattern(
+    activeWorkspaceFolder,
+    '{*.flix,src/**/*.flix,test/**/*.flix,lib/**/*.fpkg}',
   )
-  const urisToDelete = namesToDelete.map(name => vscode.Uri.joinPath(uri, name))
-  await Promise.allSettled(urisToDelete.map(uri => vscode.workspace.fs.delete(uri)))
 
-  const removedHere = namesToDelete.filter(name => name.endsWith('.flix')).length
-  return removedHere + removedInSubdirs.reduce((sum, n) => sum + n, 0)
+  const uris = await vscode.workspace.findFiles(pattern)
+  await Promise.all(uris.map(uri => vscode.workspace.fs.delete(uri)))
 }
 
 /**
- * Opens the document at `docUri` in the main editor.
+ * Returns the content of the file at `uri` as a string.
  */
-export async function open(docUri: vscode.Uri) {
-  const doc = await vscode.workspace.openTextDocument(docUri)
-  await vscode.window.showTextDocument(doc)
+async function readFileContent(uri: vscode.Uri): Promise<string> {
+  return Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8')
 }
 
 /**
- * Types the given `text` in the editor at the current position.
+ * Finds the `.flix` files directly in the given test workspace directory, which are the ones
+ * {@linkcode init} loads.
+ *
+ * Subdirectories are left alone, so that a fixture which must not be part of the program from the
+ * start can be put in one, and loaded by the test itself with {@linkcode loadFile}.
+ */
+async function findFixtureFiles(testWorkspaceName: string): Promise<vscode.Uri[]> {
+  const dirUri = getFileUri(path.resolve(__dirname, '../testWorkspaces', testWorkspaceName))
+  const contents = await vscode.workspace.fs.readDirectory(dirUri)
+
+  return contents
+    .filter(([name, type]) => type !== vscode.FileType.Directory && name.endsWith('.flix'))
+    .map(([name, _]) => vscode.Uri.joinPath(dirUri, name))
+}
+
+/**
+ * Types the given `text` in the editor at the current position, and waits for the compiler to
+ * process it.
+ *
+ * The document is deliberately not saved: the extension sends the compiler the content of the
+ * editor, so the change reaches it either way, and leaving the file on disk alone means the caller
+ * can type into a fixture without modifying it.
  */
 export async function typeText(text: string) {
   await awaitCheck(async () => {
     await vscode.commands.executeCommand('type', { text })
-    await vscode.window.activeTextEditor.document.save()
   })
 }
 
 /**
- * Replaces the entire content of the given document with `newContent`, saves, and waits for the compiler to process.
+ * Get the URI of the file at `p` in the test workspace directory `testWorkspaceName`, e.g.
+ * `Main.flix` in `codeActions`.
+ *
+ * This points at the file where it lives in `testWorkspaces`, which is where {@linkcode init}
+ * leaves it.
  */
-export async function replaceDocumentContent(docUri: vscode.Uri, newContent: string) {
-  const doc = await vscode.workspace.openTextDocument(docUri)
-  await vscode.window.showTextDocument(doc)
-  await awaitCheck(async () => {
-    const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length))
-    const edit = new vscode.WorkspaceEdit()
-    edit.replace(docUri, fullRange, newContent)
-    await vscode.workspace.applyEdit(edit)
-    await doc.save()
-  })
+export function getFixtureDocUri(testWorkspaceName: string, p: string) {
+  return getFileUri(path.resolve(__dirname, '../testWorkspaces', testWorkspaceName, p))
 }
 
 /**
- * Get the URI of the test document at `p` relative to the active workspace, e.g. `src/Main.flix`.
+ * Get the URI of the file at the absolute path `p`.
  */
-export function getTestDocUri(p: string) {
+export function getFileUri(p: string) {
   // The only way to produce a URI with the same path as the ones generated by vscode (lowercase drive letter).
-  return vscode.Uri.file(vscode.Uri.file(path.resolve(__dirname, '../activeWorkspace', p)).fsPath)
+  return vscode.Uri.file(vscode.Uri.file(p).fsPath)
 }
 
 /**
  * Sleeps for `ms` milliseconds.
  */
-export async function sleep(ms: number) {
+async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
@@ -203,39 +255,13 @@ async function awaitIdle() {
 }
 
 /**
- * Waits for the compiler to finish reacting to a batch of workspace file changes (the setup in
- * {@linkcode init}) and reach a stable idle state, given the {@linkcode getCheckCount} value
- * observed *before* the changes were made.
+ * Runs the `mutation`, then waits until the `lsp/check` it triggers has finished and the compiler is
+ * idle.
  *
- * Unlike a fixed sleep, this is anchored to observable compiler progress:
- *
- * 1. {@linkcode waitForCheckSince} blocks until the file-system watcher has fired and a check has
- *    completed, so we never sample idle against stale, pre-change state.
- * 2. We then repeatedly drain the queue ({@linkcode awaitIdle}) until the observed check count stops
- *    advancing across a full {@linkcode RECONCILE_SETTLE_MS} window. A create/delete schedules a
- *    debounced reconciliation that can enqueue a *follow-up* check (e.g. when VS Code delivers a
- *    single folder-level event instead of per-file events), so returning on the first idle would be
- *    premature.
- */
-async function settleAfterChange(baseline: number) {
-  await waitForCheckSince(baseline)
-  for (;;) {
-    await awaitIdle()
-    const count = await getCheckCount()
-    await sleep(RECONCILE_SETTLE_MS)
-    if ((await getCheckCount()) === count) {
-      return
-    }
-  }
-}
-
-/**
- * Runs the filesystem `mutation`, then waits until the `lsp/check` it triggers has finished and the
- * compiler is idle.
- *
- * This is the synchronization primitive for in-test file mutations (those that run while the
- * extension is already active and idle), and it is race-free because it baselines the check count
- * *before* the mutation:
+ * This is the synchronization primitive for changes the extension only hears about through a
+ * file-system watcher or an editor, which fire at a time of their own choosing — unlike a file
+ * handed to the compiler directly, for which waiting for idle is enough. It is race-free because it
+ * baselines the check count *before* the mutation:
  *
  * - The leading {@linkcode waitForCheckSince} proves the file-system watcher fired and a check
  *   completed, so we never sample idle against stale, pre-change state (the old `sleep(1000)` was a
@@ -245,7 +271,7 @@ async function settleAfterChange(baseline: number) {
  *   collection, because the server sends them before the idle signal on the same ordered channel
  *   (so the old trailing `sleep(1000)` is unnecessary).
  */
-async function awaitCheck<T>(mutation: () => Promise<T>): Promise<T> {
+export async function awaitCheck<T>(mutation: () => Promise<T>): Promise<T> {
   const before = await getCheckCount()
   const result = await mutation()
   await waitForCheckSince(before)
@@ -254,86 +280,10 @@ async function awaitCheck<T>(mutation: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Add a file with the given `uri` and `content`, and wait for the compiler to process this.
- */
-export async function addFile(uri: vscode.Uri, content: string | Uint8Array) {
-  await awaitCheck(async () => {
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(content))
-  })
-}
-
-/**
- * Copies the contents of the given folder `from` to the folder `to`, leaving non-overlapping files
- * intact.
- *
- * Does not wait for the compiler to react — callers synchronize via {@linkcode settleAfterChange}
- * (workspace setup) or {@linkcode awaitCheck} (in-test mutations).
- */
-export async function copyDirContents(from: vscode.Uri, to: vscode.Uri) {
-  const contents = await vscode.workspace.fs.readDirectory(from)
-  const names = contents.map(([name, _]) => name)
-
-  const uris = names.map(name => ({ from: vscode.Uri.joinPath(from, name), to: vscode.Uri.joinPath(to, name) }))
-
-  await Promise.allSettled(uris.map(({ from, to }) => vscode.workspace.fs.copy(from, to, { overwrite: true })))
-}
-
-/**
- * Copy the file from `from` to `to`, and wait for the compiler to process this.
- */
-export async function copyFile(from: vscode.Uri, to: vscode.Uri) {
-  await awaitCheck(async () => {
-    await vscode.workspace.fs.copy(from, to, { overwrite: true })
-  })
-}
-
-/**
- * Delete the file at `uri`, and wait for the compiler to process this.
- *
- * Throws if the file does not exist.
- */
-export async function deleteFile(uri: vscode.Uri) {
-  await awaitCheck(async () => {
-    await vscode.workspace.fs.delete(uri)
-  })
-}
-
-/**
- * Tries to delete the file at `uri`, but does nothing if the file does not exist.
- */
-export async function tryDeleteFile(uri: vscode.Uri) {
-  try {
-    await deleteFile(uri)
-  } catch {
-    // File does not exist - no need to delete
-  }
-}
-
-/**
  * Pretty print the given `val` as a JSON string.
  */
 export function stringify(val: unknown): string {
   return JSON.stringify(val, null, 2)
-}
-
-/**
- * Normalize the given `uri` to a canonical form.
- */
-function normalizeUri(uri: vscode.Uri) {
-  // Strip out unnecessary information such as _formatted
-  return vscode.Uri.parse(uri.toString())
-}
-
-/**
- * Returns the given `location` (which can be either a {@linkcode vscode.Location} or {@linkcode vscode.LocationLink})
- * as a {@linkcode vscode.Location} in a canonical form.
- */
-export function normalizeLocation(location: vscode.Location | vscode.LocationLink) {
-  if (location instanceof vscode.Location) {
-    return new vscode.Location(normalizeUri(location.uri), location.range)
-  } else {
-    return new vscode.Location(normalizeUri(location.targetUri), location.targetRange)
-  }
 }
 
 /**

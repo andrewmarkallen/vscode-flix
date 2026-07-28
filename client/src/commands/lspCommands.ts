@@ -22,6 +22,17 @@ export function showAst(client: LanguageClient) {
   }
 }
 
+/**
+ * Adds the file with the given `uri` and `src` content to the compiler.
+ *
+ * Unlike the file watchers, this does not require the file to be part of the workspace, and the
+ * content is taken from `src` rather than from disk. Tests use this to load a workspace without
+ * copying any files into place, and to empty a file again by adding it with no content.
+ */
+export function addUri(client: LanguageClient) {
+  return (uri: string, src: string) => client.sendNotification(jobs.Request.apiAddUri, { uri, src })
+}
+
 export function allJobsFinished(client: LanguageClient, eventEmitter: EventEmitter) {
   return () =>
     new Promise(resolve => {

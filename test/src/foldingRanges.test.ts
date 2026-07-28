@@ -16,23 +16,26 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { getTestDocUri, init, open } from './util'
+import { getFixtureDocUri, init, teardown } from './util'
 
 suite('FoldingRangeProvider', () => {
-  const mainDocUri = getTestDocUri('src/Main.flix')
+  const mainDocUri = getFixtureDocUri('foldingRanges', 'Main.flix')
 
   suiteSetup(async () => {
     await init('foldingRanges')
   })
 
+  suiteTeardown(async () => {
+    await teardown('foldingRanges')
+  })
+
   test('Should fold multi-line doc, line, and block comments', async () => {
-    await open(mainDocUri)
     const ranges = await vscode.commands.executeCommand<vscode.FoldingRange[]>(
       'vscode.executeFoldingRangeProvider',
       mainDocUri,
     )
 
-    // Lines are zero-indexed. See `test/testWorkspaces/foldingRanges/src/Main.flix`.
+    // Lines are zero-indexed. See `test/testWorkspaces/foldingRanges/Main.flix`.
     const actual = ranges.map(r => ({ start: r.start, end: r.end, kind: r.kind })).sort((a, b) => a.start - b.start)
 
     const expected = [

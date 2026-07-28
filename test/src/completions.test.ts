@@ -16,18 +16,25 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { getTestDocUri, init, open, typeText, addFile } from './util'
+import { getFixtureDocUri, init, teardown, typeText } from './util'
 
 suite('CompletionProvider', () => {
-  const docUri = getTestDocUri('src/Temp.flix')
+  const docUri = getFixtureDocUri('completions', 'Empty.flix')
 
   suiteSetup(async () => {
     await init('completions')
   })
 
+  suiteTeardown(async () => {
+    // Discard the typed text without saving it, so that the fixture is left empty on disk, and no
+    // dirty editor is left for the next suite to trip over when it closes all editors.
+    await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor')
+    await teardown('completions')
+  })
+
   test('Should propose completing mod', async () => {
-    await addFile(docUri, '')
-    await open(docUri)
+    // Typing goes to the active editor, so the document has to be shown
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(docUri))
     await typeText('mo')
 
     const position = new vscode.Position(0, 2)

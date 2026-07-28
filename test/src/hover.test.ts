@@ -16,14 +16,17 @@
 
 import * as assert from 'assert'
 import * as vscode from 'vscode'
-import { findMarkerPosition, getTestDocUri, init, open } from './util'
+import { findMarkerPosition, getFixtureDocUri, init, teardown } from './util'
 
 suite('HoverProvider', () => {
-  const docUri = getTestDocUri('src/Main.flix')
+  const docUri = getFixtureDocUri('hover', 'Main.flix')
 
   suiteSetup(async () => {
     await init('hover')
-    await open(docUri)
+  })
+
+  suiteTeardown(async () => {
+    await teardown('hover')
   })
 
   test('Should show Type when hovering on Unit', async () => {
